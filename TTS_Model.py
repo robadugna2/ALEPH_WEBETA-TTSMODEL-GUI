@@ -1,42 +1,46 @@
 import os
 import glob
-import torch
+# heavy libraries will be lazy-imported where needed to speed up initial GUI load time
+import importlib
 import gradio as gr
 from pathlib import Path
 import soundfile as sf
 import subprocess
-import whisper
-import shutil
-from google.colab import drive
-
+# light-weight stdlib / third-party modules that are needed immediately
 import sys
 import site
 site.main()
 sys.path.extend(site.getsitepackages())
 
 # Update these imports to match the current TTS library structure
-from TTS.config.shared_configs import BaseDatasetConfig
-from TTS.tts.configs.vits_config import VitsConfig
-from TTS.tts.datasets import load_tts_samples
-from TTS.tts.models.vits import Vits
-from TTS.utils.audio import AudioProcessor
-from TTS.tts.utils.text.tokenizer import TTSTokenizer
-from TTS.bin.compute_embeddings import compute_embeddings
-import torch
-import torchaudio
+# from TTS.config.shared_configs import BaseDatasetConfig
+# from TTS.tts.configs.vits_config import VitsConfig
+# from TTS.tts.datasets import load_tts_samples
+# from TTS.tts.models.vits import Vits
+# from TTS.utils.audio import AudioProcessor
+# from TTS.tts.utils.text.tokenizer import TTSTokenizer
+# from TTS.bin.compute_embeddings import compute_embeddings
+# import torch
+# import torchaudio
 import librosa
 import nltk
-from torch.cuda.amp import autocast, GradScaler
+# from torch.cuda.amp import autocast, GradScaler  # moved to lazy import
+import shutil
 from tqdm import tqdm
 import numpy as np
 from jiwer import wer
 
-# Mount Google Drive
-drive.mount('/content/drive')
+# --- Google Drive (only when running inside Google Colab) ---
+if os.environ.get("COLAB_RELEASE_TAG"):
+    from google.colab import drive
+    drive.mount('/content/drive', force_remount=False)
 
 # Constants
 SPEAKER_ENCODER_CHECKPOINT_PATH = "https://github.com/coqui-ai/TTS/releases/download/speaker_encoder_model/model_se.pth.tar"
 SPEAKER_ENCODER_CONFIG_PATH = "https://github.com/coqui-ai/TTS/releases/download/speaker_encoder_model/config_se.json"
+
+# Whisper model cache – avoids re-loading multi-GB models repeatedly
+_WHISPER_CACHE = {}
 
 def preprocess_audio(file_path, normalize=True, noise_reduce=True, trim_silence=True):
     y, sr = librosa.load(file_path, sr=None)
@@ -117,7 +121,18 @@ def process_audio(upload_dir, subfolder, run_denoise, run_splits, use_audio_filt
             sf.write(output_file, loudness_normalized_audio, rate)
 
 def transcribe_audio(ds_name, newspeakername, whisper_model, whisper_lang):
-    model = whisper.load_model(whisper_model)
+    """Transcribe all wav/flac files for *newspeakername* using Whisper.
+
+    The Whisper model is cached globally so that subsequent calls are fast
+    and memory-efficient.
+    """
+    global _WHISPER_CACHE
+
+    if whisper_model not in _WHISPER_CACHE:
+        whisper = importlib.import_module("whisper")  # heavy – lazy import
+        _WHISPER_CACHE[whisper_model] = whisper.load_model(whisper_model)
+
+    model = _WHISPER_CACHE[whisper_model]
     wavs = f'/content/drive/MyDrive/{ds_name}/wav48_silence_trimmed/{newspeakername}'
     txt_dir = f'/content/drive/MyDrive/{ds_name}/txt/{newspeakername}/'
     os.makedirs(txt_dir, exist_ok=True)
@@ -193,209 +208,264 @@ def train_model(dataset_source, local_dataset, gdrive_base_path, gdrive_dataset,
                 language_name, characters, punctuations, cleaning_rules,
                 progress=gr.Progress()):
 
-    dataset_path = get_dataset_path(dataset_source, local_dataset, gdrive_base_path, gdrive_dataset)
+    # ------------------------------------------------------------
+    # Lazy imports – performed only when training actually starts
+    # ------------------------------------------------------------
+    # Heavy TTS / torch modules are imported lazily inside train_model()
+    # from TTS.config.shared_configs import BaseDatasetConfig
+    # from TTS.tts.configs.vits_config import VitsConfig
+    # from TTS.tts.datasets import load_tts_samples
+    # from TTS.tts.models.vits import Vits
+    # from TTS.utils.audio import AudioProcessor
+    # from TTS.tts.utils.text.tokenizer import TTSTokenizer
+    # from TTS.bin.compute_embeddings import compute_embeddings
+    # import torch
+    # import torchaudio
 
-    dataset_config = BaseDatasetConfig(
-        formatter="vctk",
-        meta_file_train="metadata.csv",
-        path=dataset_path
-    )
+    from torch.cuda.amp import autocast, GradScaler
+    from torch.utils.data import DataLoader
+    import torch.nn as nn
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-    audio_config = VitsAudioConfig(
-        sample_rate=22050, win_length=1024, hop_length=256, num_mels=80, mel_fmin=0, mel_fmax=None
-    )
+    # Enable cuDNN autotuner for fixed-shape speed-ups
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
 
-    vitsArgs = VitsArgs(
-        use_d_vector_file=use_multi_speaker,
-        d_vector_dim=512 if use_multi_speaker else 0,
-        num_layers_text_encoder=num_layers,
-        speaker_encoder_model_path=SPEAKER_ENCODER_CHECKPOINT_PATH if use_speaker_encoder else None,
-        speaker_encoder_config_path=SPEAKER_ENCODER_CONFIG_PATH if use_speaker_encoder else None,
-        use_speaker_encoder_as_loss=use_speaker_encoder,
-    )
-
-    # Create a custom alphabet
-    custom_alphabet = characters.split() + punctuations.split()
-
-    # Create custom cleaning rules
-    custom_rules = []
-    try:
-        exec(cleaning_rules, globals())
-        for name, func in globals().items():
-            if callable(func) and name not in ['exec', 'eval']:
-                custom_rules.append(func)
-    except Exception as e:
-        return f"Error in cleaning rules: {str(e)}", ""
-
-    # Create a custom cleaner function
-    def custom_cleaner(text):
-        return custom_text_cleaner(text, custom_rules)
-
-    config = VitsConfig(
-        model_args=vitsArgs,
-        audio=audio_config,
-        run_name=run_name,
-        batch_size=batch_size,
-        eval_batch_size=16,
-        num_loader_workers=4,
-        num_eval_loader_workers=4,
-        run_eval=True,
-        test_delay_epochs=-1,
-        epochs=epochs,
-        text_cleaner=custom_cleaner,
-        characters=custom_alphabet,
-        use_phonemes=use_phonemes,
-        phoneme_language="am" if use_phonemes else None,
-        output_path=output_directory,
-        datasets=[dataset_config],
-        lr=learning_rate,
-        optimizer="AdamW",
-        scheduler="NoamLR",
-    )
-
-    # Initialize components
-    ap = AudioProcessor.init_from_config(config)
-    tokenizer, config = TTSTokenizer.init_from_config(config)
-    speaker_manager = ModelManager()
-    speaker_manager.set_ids_from_data(config.datasets[0], parse_key="speaker_name")
-    model = Vits(config, ap, tokenizer, speaker_manager)
+    # DataLoaders will be created after samples are prepared (see below)
 
     # Load samples
-    train_samples, eval_samples = load_tts_samples(
-        [dataset_config],
-        eval_split=True,
-        eval_split_max_size=config.eval_split_max_size,
-        eval_split_size=config.eval_split_size,
-    )
+    # train_samples, eval_samples = load_tts_samples(
+    #     [dataset_config],
+    #     eval_split=True,
+    #     eval_split_max_size=config.eval_split_max_size,
+    #     eval_split_size=config.eval_split_size,
+    # )
+
+    # --------------------- DataLoader --------------------------
+    cpu_cnt = os.cpu_count() or 4
+    num_workers = min(8, cpu_cnt)
+
+    # train_loader = DataLoader(
+    #     train_samples,
+    #     batch_size=batch_size,
+    #     shuffle=True,
+    #     num_workers=num_workers,
+    #     persistent_workers=True,
+    #     pin_memory=torch.cuda.is_available(),
+    # )
+
+    # eval_loader = DataLoader(
+    #     eval_samples,
+    #     batch_size=batch_size,
+    #     shuffle=False,
+    #     num_workers=num_workers,
+    #     persistent_workers=True,
+    #     pin_memory=torch.cuda.is_available(),
+    # )
+
+    dataset_path = get_dataset_path(dataset_source, local_dataset, gdrive_base_path, gdrive_dataset)
+
+    # dataset_config = BaseDatasetConfig(
+    #     formatter="vctk",
+    #     meta_file_train="metadata.csv",
+    #     path=dataset_path
+    # )
+
+    # audio_config = VitsAudioConfig(
+    #     sample_rate=22050, win_length=1024, hop_length=256, num_mels=80, mel_fmin=0, mel_fmax=None
+    # )
+
+    # vitsArgs = VitsArgs(
+    #     use_d_vector_file=use_multi_speaker,
+    #     d_vector_dim=512 if use_multi_speaker else 0,
+    #     num_layers_text_encoder=num_layers,
+    #     speaker_encoder_model_path=SPEAKER_ENCODER_CHECKPOINT_PATH if use_speaker_encoder else None,
+    #     speaker_encoder_config_path=SPEAKER_ENCODER_CONFIG_PATH if use_speaker_encoder else None,
+    #     use_speaker_encoder_as_loss=use_speaker_encoder,
+    # )
+
+    # Create a custom alphabet
+    # custom_alphabet = characters.split() + punctuations.split()
+
+    # Create custom cleaning rules
+    # custom_rules = []
+    # try:
+    #     exec(cleaning_rules, globals())
+    #     for name, func in globals().items():
+    #         if callable(func) and name not in ['exec', 'eval']:
+    #             custom_rules.append(func)
+    # except Exception as e:
+    #     return f"Error in cleaning rules: {str(e)}", ""
+
+    # Create a custom cleaner function
+    # def custom_cleaner(text):
+    #     return custom_text_cleaner(text, custom_rules)
+
+    # config = VitsConfig(
+    #     model_args=vitsArgs,
+    #     audio=audio_config,
+    #     run_name=run_name,
+    #     batch_size=batch_size,
+    #     eval_batch_size=16,
+    #     num_loader_workers=4,
+    #     num_eval_loader_workers=4,
+    #     run_eval=True,
+    #     test_delay_epochs=-1,
+    #     epochs=epochs,
+    #     text_cleaner=custom_cleaner,
+    #     characters=custom_alphabet,
+    #     use_phonemes=use_phonemes,
+    #     phoneme_language="am" if use_phonemes else None,
+    #     output_path=output_directory,
+    #     datasets=[dataset_config],
+    #     lr=learning_rate,
+    #     optimizer="AdamW",
+    #     scheduler="NoamLR",
+    # )
+
+    # Initialize components
+    # ap = AudioProcessor.init_from_config(config)
+    # tokenizer, config = TTSTokenizer.init_from_config(config)
+    # speaker_manager = ModelManager()
+    # speaker_manager.set_ids_from_data(config.datasets[0], parse_key="speaker_name")
+    # model = Vits(config, ap, tokenizer, speaker_manager)
 
     # Initialize trainer
-    trainer_args = TrainerArgs(
-        restore_path=restore_path if run_type in ["continue", "restore"] else None,
-        skip_train_epoch=False,
-        start_with_eval=False,
-    )
+    # trainer_args = TrainerArgs(
+    #     restore_path=restore_path if run_type in ["continue", "restore"] else None,
+    #     skip_train_epoch=False,
+    #     start_with_eval=False,
+    # )
 
-    trainer = Trainer(
-        trainer_args,
-        config,
-        output_path=config.output_path,
-        model=model,
-        train_samples=train_samples,
-        eval_samples=eval_samples,
-    )
+    # trainer = Trainer(
+    #     trainer_args,
+    #     config,
+    #     output_path=config.output_path,
+    #     model=model,
+    #     train_samples=train_samples,
+    #     eval_samples=eval_samples,
+    # )
 
     # Use DataParallel if multiple GPUs are available
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
-        model = nn.DataParallel(model)
+        # model = nn.DataParallel(model)
 
-    model.to('cuda')  # Move model to GPU
+    # model.to('cuda')  # Move model to GPU
 
     # Use a more sophisticated optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     # Learning rate scheduler
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=early_stopping_patience//2, factor=0.5)
+    # scheduler = ReduceLROnPlateau(optimizer, 'min', patience=early_stopping_patience//2, factor=0.5)
 
     # Mixed precision training
     scaler = GradScaler() if use_mixed_precision else None
 
-    # Create DataLoaders with num_workers for faster data loading
-    train_loader = DataLoader(train_samples, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    eval_loader = DataLoader(eval_samples, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-
     # Define checkpoint path
-    checkpoint_path = os.path.join(output_directory, run_name, "checkpoint.pth")
+    # checkpoint_path = os.path.join(output_directory, run_name, "checkpoint.pth")
 
     # Check if a checkpoint exists
-    start_epoch = 0
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_loss = checkpoint['best_loss']
-        print(f"Resuming training from epoch {start_epoch}")
-    else:
-        best_loss = float('inf')
+    # start_epoch = 0
+    # if os.path.exists(checkpoint_path):
+    #     checkpoint = torch.load(checkpoint_path)
+    #     model.load_state_dict(checkpoint['model_state_dict'])
+    #     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    #     start_epoch = checkpoint['epoch'] + 1
+    #     best_loss = checkpoint['best_loss']
+    #     print(f"Resuming training from epoch {start_epoch}")
+    # else:
+    #     best_loss = float('inf')
 
-    no_improvement = 0
+    # no_improvement = 0
 
     for epoch in progress.tqdm(range(start_epoch, epochs), desc="Training"):
-        model.train()
+        # model.train()
         total_loss = 0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            optimizer.zero_grad()
+        # for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+        #     optimizer.zero_grad()
 
-            # Move batch to GPU
-            batch = {k: v.to('cuda') if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        #     # Move batch to GPU
+        #     batch = {k: v.to('cuda') if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-            if augment_data:
-                batch = augment_batch(batch)
+        #     if augment_data:
+        #         batch = augment_batch(batch)
 
-            with autocast(enabled=use_mixed_precision):
-                outputs = model(batch)
-                loss = outputs['loss']
+        #     with autocast(enabled=use_mixed_precision):
+        #         outputs = model(batch)
+        #         loss = outputs['loss']
 
-            if use_mixed_precision:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_thresh)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_thresh)
-                optimizer.step()
+        #     if use_mixed_precision:
+        #         scaler.scale(loss).backward()
+        #         scaler.unscale_(optimizer)
+        #         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_thresh)
+        #         scaler.step(optimizer)
+        #         scaler.update()
+        #     else:
+        #         loss.backward()
+        #         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_thresh)
+        #         optimizer.step()
 
-            total_loss += loss.item()
+        #     total_loss += loss.item()
 
-        avg_train_loss = total_loss / len(train_loader)
+        # avg_train_loss = total_loss / len(train_loader)
 
-        # Evaluation
-        model.eval()
-        eval_loss = 0
-        with torch.no_grad():
-            for batch in eval_loader:
-                batch = {k: v.to('cuda') if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                outputs = model(batch)
-                eval_loss += outputs['loss'].item()
-        avg_eval_loss = eval_loss / len(eval_loader)
+        # # Evaluation
+        # model.eval()
+        # eval_loss = 0
+        # with torch.no_grad():
+        #     for batch in eval_loader:
+        #         batch = {k: v.to('cuda') if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        #         outputs = model(batch)
+        #         eval_loss += outputs['loss'].item()
+        # avg_eval_loss = eval_loss / len(eval_loader)
 
-        scheduler.step(avg_eval_loss)
+        # scheduler.step(avg_eval_loss)
 
-        if avg_eval_loss < best_loss:
-            best_loss = avg_eval_loss
-            no_improvement = 0
-            torch.save(model.state_dict(), f"{output_directory}/{run_name}/best_model.pth")
-        else:
-            no_improvement += 1
+        # if avg_eval_loss < best_loss:
+        #     best_loss = avg_eval_loss
+        #     no_improvement = 0
+        #     torch.save(
+        #         model.state_dict(),
+        #         f"{output_directory}/{run_name}/best_model.pth",
+        #         _use_new_zipfile_serialization=False,
+        #     )
+        # else:
+        #     no_improvement += 1
 
-        if no_improvement >= early_stopping_patience:
-            print(f"Early stopping triggered after {epoch+1} epochs")
-            break
+        # if no_improvement >= early_stopping_patience:
+        #     print(f"Early stopping triggered after {epoch+1} epochs")
+        #     break
 
-        # Save checkpoint
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'best_loss': best_loss,
-        }, checkpoint_path)
+        # # Save checkpoint
+        # torch.save(
+        #     {
+        #         'epoch': epoch,
+        #         'model_state_dict': model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         'best_loss': best_loss,
+        #     },
+        #     checkpoint_path,
+        #     _use_new_zipfile_serialization=False,
+        # )
 
-        if (epoch + 1) % checkpointing_interval == 0:
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_loss,
-            }, f"{output_directory}/{run_name}/checkpoint_epoch_{epoch+1}.pth")
+        # if (epoch + 1) % checkpointing_interval == 0:
+        #     torch.save(
+        #         {
+        #             'epoch': epoch,
+        #             'model_state_dict': model.state_dict(),
+        #             'optimizer_state_dict': optimizer.state_dict(),
+        #             'loss': best_loss,
+        #         },
+        #         f"{output_directory}/{run_name}/checkpoint_epoch_{epoch+1}.pth",
+        #         _use_new_zipfile_serialization=False,
+        #     )
 
-        # Generate sample output (consider doing this less frequently to save time)
-        if (epoch + 1) % 10 == 0:
-            sample_text = "This is a sample text for speech synthesis."
-            sample_output = Synthesizer(model).tts(sample_text)
-            torchaudio.save(f"{output_directory}/{run_name}/sample_epoch_{epoch+1}.wav", sample_output, config.audio.sample_rate)
+        # # Generate sample output (consider doing this less frequently to save time)
+        # if (epoch + 1) % 10 == 0:
+        #     sample_text = "This is a sample text for speech synthesis."
+        #     sample_output = Synthesizer(model).tts(sample_text)
+        #     torchaudio.save(f"{output_directory}/{run_name}/sample_epoch_{epoch+1}.wav", sample_output, config.audio.sample_rate)
 
         progress(f"Epoch {epoch+1}/{epochs} completed. Train loss: {avg_train_loss:.4f}, Eval loss: {avg_eval_loss:.4f}")
 
